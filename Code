@@ -1,0 +1,682 @@
+/************************************************************
+  ESP32 Industrial Equipment Health Monitoring System
+  FreeRTOS + Blynk + Wokwi
+************************************************************/
+#define BLYNK_TEMPLATE_ID   "TMPL3dXAEaysw"
+#define BLYNK_TEMPLATE_NAME "HEALTH MONITORING"
+#define BLYNK_AUTH_TOKEN    "c5R1_9tuRknlwfdyfGq8OnJIi4KVXp9c"
+
+#define BLYNK_PRINT Serial
+
+#include <WiFi.h>
+#include <Wire.h>
+#include <BlynkSimpleEsp32.h>
+#include <DHTesp.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+/* Wi-Fi for Wokwi */
+
+char ssid[] = "Wokwi-GUEST";
+char pass[] = "";
+
+/* ESP32 pins */
+
+#define DHT_PIN        15
+#define CURRENT_PIN    34
+
+#define GREEN_LED_PIN   2
+#define RED_LED_PIN     5
+#define BUZZER_PIN     18
+
+#define SDA_PIN        21
+#define SCL_PIN        22
+
+/* OLED */
+
+#define SCREEN_WIDTH   128
+#define SCREEN_HEIGHT   64
+#define OLED_ADDRESS  0x3C
+
+DHTesp dht;
+Adafruit_MPU6050 mpu;
+
+Adafruit_SSD1306 display(
+  SCREEN_WIDTH,
+  SCREEN_HEIGHT,
+  &Wire,
+  -1
+);
+
+BlynkTimer blynkTimer;
+
+/* Equipment data */
+
+struct SensorData
+{
+  float temperature;
+  float humidity;
+
+  float accelerationX;
+  float accelerationY;
+  float accelerationZ;
+
+  float vibration;
+  float sensorVoltage;
+  float current;
+
+  int adcValue;
+
+  bool dhtError;
+  bool mpuError;
+  bool fault;
+};
+
+SensorData equipmentData;
+
+SemaphoreHandle_t dataMutex;
+SemaphoreHandle_t i2cMutex;
+
+bool mpuFound = false;
+bool oledFound = false;
+
+/* Fault limits */
+
+const float MAX_TEMPERATURE = 50.0;
+const float MAX_VIBRATION = 1.50;
+const float MAX_CURRENT = 20.0;
+
+/* Function declarations */
+
+void sensorTask(void *parameter);
+void displayTask(void *parameter);
+void alarmTask(void *parameter);
+
+void sendDataToBlynk();
+
+/* =========================================================
+   Sensor task
+   ========================================================= */
+
+void sensorTask(void *parameter)
+{
+  TickType_t lastWakeTime = xTaskGetTickCount();
+
+  while (true)
+  {
+    SensorData newData = {};
+
+    /* Read DHT22 */
+
+    TempAndHumidity dhtValue =
+      dht.getTempAndHumidity();
+
+    if (
+      isnan(dhtValue.temperature) ||
+      isnan(dhtValue.humidity)
+    )
+    {
+      newData.dhtError = true;
+      newData.temperature = 0;
+      newData.humidity = 0;
+    }
+    else
+    {
+      newData.dhtError = false;
+      newData.temperature = dhtValue.temperature;
+      newData.humidity = dhtValue.humidity;
+    }
+
+    /* Read MPU6050 */
+
+    newData.mpuError = !mpuFound;
+
+    if (mpuFound)
+    {
+      sensors_event_t acceleration;
+      sensors_event_t gyro;
+      sensors_event_t sensorTemperature;
+
+      if (
+        xSemaphoreTake(
+          i2cMutex,
+          pdMS_TO_TICKS(200)
+        ) == pdTRUE
+      )
+      {
+        mpu.getEvent(
+          &acceleration,
+          &gyro,
+          &sensorTemperature
+        );
+
+        xSemaphoreGive(i2cMutex);
+
+        newData.mpuError = false;
+
+        /* Values for Blynk acceleration chart */
+
+        newData.accelerationX =
+          acceleration.acceleration.x;
+
+        newData.accelerationY =
+          acceleration.acceleration.y;
+
+        newData.accelerationZ =
+          acceleration.acceleration.z;
+
+        /* Convert acceleration to g */
+
+        float axG =
+          newData.accelerationX / 9.80665;
+
+        float ayG =
+          newData.accelerationY / 9.80665;
+
+        float azG =
+          newData.accelerationZ / 9.80665;
+
+        float accelerationMagnitude =
+          sqrt(
+            axG * axG +
+            ayG * ayG +
+            azG * azG
+          );
+
+        /*
+          Remove normal gravity to obtain a simple
+          vibration indicator.
+        */
+
+        newData.vibration =
+          fabs(accelerationMagnitude - 1.0);
+
+        if (newData.vibration < 0.005)
+        {
+          newData.vibration = 0.0;
+        }
+      }
+    }
+
+    /* Read potentiometer */
+
+    newData.adcValue =
+      analogRead(CURRENT_PIN);
+
+    newData.sensorVoltage =
+      newData.adcValue * 3.3 / 4095.0;
+
+    /*
+      Simulated current:
+      0V   = 0A
+      3.3V = 30A
+    */
+
+    newData.current =
+      newData.adcValue * 30.0 / 4095.0;
+
+    /* Check faults */
+
+    bool temperatureFault =
+      !newData.dhtError &&
+      newData.temperature > MAX_TEMPERATURE;
+
+    bool vibrationFault =
+      !newData.mpuError &&
+      newData.vibration > MAX_VIBRATION;
+
+    bool currentFault =
+      newData.current > MAX_CURRENT;
+
+    newData.fault =
+      newData.dhtError ||
+      newData.mpuError ||
+      temperatureFault ||
+      vibrationFault ||
+      currentFault;
+
+    /* Save data safely */
+
+    if (
+      xSemaphoreTake(
+        dataMutex,
+        pdMS_TO_TICKS(200)
+      ) == pdTRUE
+    )
+    {
+      equipmentData = newData;
+      xSemaphoreGive(dataMutex);
+    }
+
+    /* Serial Monitor */
+
+    Serial.println();
+    Serial.println("--------------------------------");
+
+    if (newData.dhtError)
+    {
+      Serial.println("Temperature: DHT22 ERROR");
+      Serial.println("Humidity: DHT22 ERROR");
+    }
+    else
+    {
+      Serial.print("Temperature: ");
+      Serial.print(newData.temperature, 1);
+      Serial.println(" C");
+
+      Serial.print("Humidity: ");
+      Serial.print(newData.humidity, 1);
+      Serial.println(" %");
+    }
+
+    if (newData.mpuError)
+    {
+      Serial.println("MPU6050: ERROR");
+    }
+    else
+    {
+      Serial.print("Acceleration X: ");
+      Serial.print(newData.accelerationX, 2);
+      Serial.println(" m/s2");
+
+      Serial.print("Acceleration Y: ");
+      Serial.print(newData.accelerationY, 2);
+      Serial.println(" m/s2");
+
+      Serial.print("Acceleration Z: ");
+      Serial.print(newData.accelerationZ, 2);
+      Serial.println(" m/s2");
+
+      Serial.print("Vibration: ");
+      Serial.print(newData.vibration, 3);
+      Serial.println(" g");
+    }
+
+    Serial.print("ADC: ");
+    Serial.println(newData.adcValue);
+
+    Serial.print("Sensor Voltage: ");
+    Serial.print(newData.sensorVoltage, 2);
+    Serial.println(" V");
+
+    Serial.print("Current: ");
+    Serial.print(newData.current, 2);
+    Serial.println(" A");
+
+    Serial.print("Status: ");
+    Serial.println(
+      newData.fault ? "FAULT" : "NORMAL"
+    );
+
+    vTaskDelayUntil(
+      &lastWakeTime,
+      pdMS_TO_TICKS(2000)
+    );
+  }
+}
+
+/* =========================================================
+   OLED task
+   ========================================================= */
+
+void displayTask(void *parameter)
+{
+  while (true)
+  {
+    if (!oledFound)
+    {
+      vTaskDelay(pdMS_TO_TICKS(1000));
+      continue;
+    }
+
+    SensorData localData = {};
+
+    if (
+      xSemaphoreTake(
+        dataMutex,
+        pdMS_TO_TICKS(200)
+      ) == pdTRUE
+    )
+    {
+      localData = equipmentData;
+      xSemaphoreGive(dataMutex);
+    }
+
+    if (
+      xSemaphoreTake(
+        i2cMutex,
+        pdMS_TO_TICKS(200)
+      ) == pdTRUE
+    )
+    {
+      display.clearDisplay();
+      display.setTextColor(SSD1306_WHITE);
+      display.setTextSize(1);
+
+      display.setCursor(0, 0);
+      display.println("EQUIPMENT MONITOR");
+
+      display.setCursor(0, 14);
+
+      if (localData.dhtError)
+      {
+        display.println("DHT22: ERROR");
+      }
+      else
+      {
+        display.print("Temp: ");
+        display.print(localData.temperature, 1);
+        display.println(" C");
+
+        display.print("Hum : ");
+        display.print(localData.humidity, 1);
+        display.println(" %");
+      }
+
+      display.print("Vib : ");
+      display.print(localData.vibration, 2);
+      display.println(" g");
+
+      display.print("Curr: ");
+      display.print(localData.current, 1);
+      display.println(" A");
+
+      display.print("ADC : ");
+      display.println(localData.adcValue);
+
+      display.print("Status: ");
+      display.println(
+        localData.fault ? "FAULT" : "NORMAL"
+      );
+
+      display.display();
+
+      xSemaphoreGive(i2cMutex);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+}
+
+/* =========================================================
+   Alarm task
+   ========================================================= */
+
+void alarmTask(void *parameter)
+{
+  while (true)
+  {
+    bool faultDetected = true;
+
+    if (
+      xSemaphoreTake(
+        dataMutex,
+        pdMS_TO_TICKS(200)
+      ) == pdTRUE
+    )
+    {
+      faultDetected = equipmentData.fault;
+      xSemaphoreGive(dataMutex);
+    }
+
+    if (faultDetected)
+    {
+      digitalWrite(RED_LED_PIN, HIGH);
+      digitalWrite(GREEN_LED_PIN, LOW);
+      tone(BUZZER_PIN, 1500);
+    }
+    else
+    {
+      digitalWrite(RED_LED_PIN, LOW);
+      digitalWrite(GREEN_LED_PIN, HIGH);
+      noTone(BUZZER_PIN);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(250));
+  }
+}
+
+/* =========================================================
+   Send data to Blynk
+   ========================================================= */
+
+void sendDataToBlynk()
+{
+  if (!Blynk.connected())
+  {
+    Serial.println("Blynk not connected");
+    return;
+  }
+
+  SensorData localData = {};
+
+  if (
+    xSemaphoreTake(
+      dataMutex,
+      pdMS_TO_TICKS(200)
+    ) == pdTRUE
+  )
+  {
+    localData = equipmentData;
+    xSemaphoreGive(dataMutex);
+  }
+  else
+  {
+    return;
+  }
+
+  /* DHT22 */
+
+  if (!localData.dhtError)
+  {
+    Blynk.virtualWrite(V0, localData.temperature);
+    Blynk.virtualWrite(V1, localData.humidity);
+  }
+
+  /* Vibration */
+
+  if (!localData.mpuError)
+  {
+    Blynk.virtualWrite(V2, localData.vibration);
+
+    /* Acceleration chart */
+
+    Blynk.virtualWrite(
+      V8,
+      localData.accelerationX
+    );
+
+    Blynk.virtualWrite(
+      V9,
+      localData.accelerationY
+    );
+
+    Blynk.virtualWrite(
+      V10,
+      localData.accelerationZ
+    );
+  }
+
+  /* Electrical values */
+
+  Blynk.virtualWrite(V3, localData.current);
+  Blynk.virtualWrite(V4, localData.sensorVoltage);
+  Blynk.virtualWrite(V5, localData.adcValue);
+
+  /* Fault status */
+
+  Blynk.virtualWrite(
+    V6,
+    localData.fault ? 1 : 0
+  );
+
+  Blynk.virtualWrite(
+    V7,
+    localData.fault ? "FAULT" : "NORMAL"
+  );
+
+  Serial.print("Blynk Acceleration X: ");
+  Serial.print(localData.accelerationX);
+
+  Serial.print(" Y: ");
+  Serial.print(localData.accelerationY);
+
+  Serial.print(" Z: ");
+  Serial.println(localData.accelerationZ);
+}
+
+/* =========================================================
+   Setup
+   ========================================================= */
+
+void setup()
+{
+  Serial.begin(115200);
+
+  pinMode(GREEN_LED_PIN, OUTPUT);
+  pinMode(RED_LED_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(CURRENT_PIN, INPUT);
+
+  digitalWrite(GREEN_LED_PIN, LOW);
+  digitalWrite(RED_LED_PIN, LOW);
+  noTone(BUZZER_PIN);
+
+  analogReadResolution(12);
+  analogSetPinAttenuation(
+    CURRENT_PIN,
+    ADC_11db
+  );
+
+  dataMutex = xSemaphoreCreateMutex();
+  i2cMutex = xSemaphoreCreateMutex();
+
+  if (
+    dataMutex == NULL ||
+    i2cMutex == NULL
+  )
+  {
+    Serial.println("Mutex creation failed");
+
+    while (true)
+    {
+      delay(1000);
+    }
+  }
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  /* DHT22 */
+
+  dht.setup(
+    DHT_PIN,
+    DHTesp::DHT22
+  );
+
+  delay(2500);
+
+  /* OLED */
+
+  oledFound = display.begin(
+    SSD1306_SWITCHCAPVCC,
+    OLED_ADDRESS
+  );
+
+  if (oledFound)
+  {
+    Serial.println("OLED detected");
+  }
+  else
+  {
+    Serial.println("OLED not detected");
+  }
+
+  /* MPU6050 */
+
+  mpuFound = mpu.begin(
+    0x68,
+    &Wire
+  );
+
+  if (mpuFound)
+  {
+    Serial.println("MPU6050 detected");
+
+    mpu.setAccelerometerRange(
+      MPU6050_RANGE_8_G
+    );
+
+    mpu.setGyroRange(
+      MPU6050_RANGE_500_DEG
+    );
+
+    mpu.setFilterBandwidth(
+      MPU6050_BAND_21_HZ
+    );
+  }
+  else
+  {
+    Serial.println("MPU6050 not detected");
+  }
+
+  /* Connect to Blynk */
+
+  Blynk.begin(
+    BLYNK_AUTH_TOKEN,
+    ssid,
+    pass
+  );
+
+  /*
+    Send data every second.
+  */
+
+  blynkTimer.setInterval(
+    1000L,
+    sendDataToBlynk
+  );
+
+  /* FreeRTOS tasks */
+
+  xTaskCreate(
+    sensorTask,
+    "Sensor Task",
+    5000,
+    NULL,
+    2,
+    NULL
+  );
+
+  xTaskCreate(
+    displayTask,
+    "Display Task",
+    4000,
+    NULL,
+    1,
+    NULL
+  );
+
+  xTaskCreate(
+    alarmTask,
+    "Alarm Task",
+    2000,
+    NULL,
+    3,
+    NULL
+  );
+
+  Serial.println("System started");
+}
+
+/* =========================================================
+   Main loop
+   ========================================================= */
+
+void loop()
+{
+  Blynk.run();
+  blynkTimer.run();
+  delay(1);
+}
